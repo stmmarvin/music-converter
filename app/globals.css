@@ -1,8 +1,11 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #fffaf7;
+  --foreground: #24140f;
+  --brand-orange: #c2410c;
+  --brand-orange-dark: #9a3412;
+  --brand-cream: #fff7ed;
 }
 
 @theme inline {
@@ -23,4 +26,83 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+  transition: background-color 180ms ease, color 180ms ease;
+}
+
+[data-theme='dark'] body {
+  --background: #1f130e;
+  --foreground: #fff7ed;
+}
+
+[data-theme='dark'] .theme-page {
+  background: radial-gradient(circle at top, #9a3412, #431407 72%) !important;
+}
+
+[data-theme='dark'] .theme-card,
+[data-theme='dark'] .theme-cookie {
+  background: #3a241b !important;
+  border-color: #b45309 !important;
+  box-shadow: 0 24px 70px rgb(28 12 5 / 45%) !important;
+}
+
+[data-theme='dark'] .theme-card .text-slate-900,
+[data-theme='dark'] .theme-cookie .text-slate-900 {
+  color: #fffaf5 !important;
+}
+
+[data-theme='dark'] .theme-card .text-slate-700,
+[data-theme='dark'] .theme-cookie .text-slate-700,
+[data-theme='dark'] .theme-card .text-slate-600,
+[data-theme='dark'] .theme-cookie .text-slate-600,
+[data-theme='dark'] .theme-card .text-slate-500,
+[data-theme='dark'] .theme-cookie .text-slate-500 {
+  color: #ffedd5 !important;
+}
+
+[data-theme='dark'] .theme-card .text-slate-400,
+[data-theme='dark'] .theme-cookie .text-slate-400 {
+  color: #fed7aa !important;
+}
+
+[data-theme='dark'] .theme-card .bg-slate-50 {
+  background: #4a2b1d !important;
+}
+
+[data-theme='dark'] .theme-card .border-slate-200,
+[data-theme='dark'] .theme-cookie .border-slate-200 {
+  border-color: #c26b24 !important;
+}
+
+[data-theme='dark'] .theme-card .border-orange-200 {
+  border-color: #d97706 !important;
+}
+
+[data-theme='dark'] .theme-card .bg-orange-50 {
+  background: #522b17 !important;
+}
+
+[data-theme='dark'] .theme-card .text-orange-600,
+[data-theme='dark'] .theme-card .text-orange-700,
+[data-theme='dark'] .theme-cookie .text-orange-700 {
+  color: #fdba74 !important;
+}
+
+[data-theme='dark'] .theme-card button[aria-selected='false'] {
+  background: #4a2b1d !important;
+  border-color: #c26b24 !important;
+  color: #ffedd5 !important;
+}
+
+[data-theme='dark'] .theme-input {
+  background: #24150f !important;
+  border-color: #d97706 !important;
+  color: #fffaf5 !important;
+}
+
+[data-theme='dark'] .theme-input::placeholder {
+  color: #fdba74 !important;
+}
+
+[data-theme='dark'] .theme-card .divide-slate-200 > :not([hidden]) ~ :not([hidden]) {
+  border-color: #7c2d12 !important;
 }

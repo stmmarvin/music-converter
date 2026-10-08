@@ -1,32 +1,39 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { spawn } from 'child_process';
 import ffmpegPath from 'ffmpeg-static';
-import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { createReadStream } from 'fs';
+import { mkdtemp, rm, stat } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import youtubedl from 'youtube-dl-exec';
 import { Readable } from 'stream';
+import { consumeDownload, getPlan, getUsageIdentity, LIMITS } from '@/app/lib/usage-limits';
 
 const FORMAT_CONFIG = {
-  mp3: { extension: 'mp3', contentType: 'audio/mpeg', mediaType: 'audio', videoCodec: undefined, audioCodec: 'libmp3lame', audioBitrate: '192k', outputFormat: 'mp3' },
-  wav: { extension: 'wav', contentType: 'audio/wav', mediaType: 'audio', videoCodec: undefined, audioCodec: 'pcm_s16le', audioBitrate: undefined, outputFormat: 'wav' },
-  m4a: { extension: 'm4a', contentType: 'audio/mp4', mediaType: 'audio', videoCodec: undefined, audioCodec: 'aac', audioBitrate: '192k', outputFormat: 'ipod' },
-  flac: { extension: 'flac', contentType: 'audio/flac', mediaType: 'audio', videoCodec: undefined, audioCodec: 'flac', audioBitrate: undefined, outputFormat: 'flac' },
+  mp3: { extension: 'mp3', contentType: 'audio/mpeg', mediaType: 'audio', audioCodec: 'libmp3lame', audioBitrate: '192k', outputFormat: 'mp3' },
+  wav: { extension: 'wav', contentType: 'audio/wav', mediaType: 'audio', audioCodec: 'pcm_s16le', audioBitrate: undefined, outputFormat: 'wav' },
+  m4a: { extension: 'm4a', contentType: 'audio/mp4', mediaType: 'audio', audioCodec: 'aac', audioBitrate: '192k', outputFormat: 'ipod' },
+  flac: { extension: 'flac', contentType: 'audio/flac', mediaType: 'audio', audioCodec: 'flac', audioBitrate: undefined, outputFormat: 'flac' },
   mp4: { extension: 'mp4', contentType: 'video/mp4', mediaType: 'video', videoCodec: 'libx264', audioCodec: 'aac', audioBitrate: undefined, outputFormat: 'mp4' },
   mpeg: { extension: 'mpeg', contentType: 'video/mpeg', mediaType: 'video', videoCodec: 'mpeg2video', audioCodec: 'mp2', audioBitrate: undefined, outputFormat: 'mpeg' },
 } as const;
 
 type AudioFormat = keyof typeof FORMAT_CONFIG;
+
 const MP3_QUALITIES = ['128', '192', '320'] as const;
 type Mp3Quality = (typeof MP3_QUALITIES)[number];
-const VIDEO_QUALITIES = ['360', '480', '720', '1080'] as const;
+
+const VIDEO_QUALITIES = ['360', '480', '720', '1080', '1440', '2160'] as const;
 type VideoQuality = (typeof VIDEO_QUALITIES)[number];
 
 const PLATFORM_HOSTS = {
-  youtube: ['youtube.com', 'youtu.be'],
+  youtube: ['youtube.com', 'music.youtube.com', 'youtu.be'],
+  spotify: ['spotify.com', 'open.spotify.com'],
   vimeo: ['vimeo.com'],
   soundcloud: ['soundcloud.com'],
   bandcamp: ['bandcamp.com'],
+  tiktok: ['tiktok.com', 'vm.tiktok.com'],
+  instagram: ['instagram.com', 'instagr.am'],
 } as const;
 
 type Platform = keyof typeof PLATFORM_HOSTS;
@@ -40,25 +47,179 @@ function matchesPlatform(url: string, platform: Platform) {
   return PLATFORM_HOSTS[platform].some((host) => hostname === host || hostname.endsWith(`.${host}`));
 }
 
-function getPlatformError(url: string) {
+function detectPlatform(url: string): Platform | null {
   try {
-    const hostname = new URL(url).hostname.toLowerCase();
-    if (hostname === 'music.apple.com' || hostname.endsWith('.music.apple.com')) {
-      return 'Apple Music links usually contain DRM-protected streams. The song page can be recognized, but the audio cannot be downloaded.';
-    }
-    if (hostname === 'music.amazon.com' || hostname.endsWith('.music.amazon.com')) {
-      return 'Amazon Music links usually contain DRM-protected streams. This audio cannot be downloaded.';
-    }
+    const hostname = new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+    return (Object.keys(PLATFORM_HOSTS) as Platform[]).find((platform) =>
+      PLATFORM_HOSTS[platform].some((host) => hostname === host || hostname.endsWith(`.${host}`)),
+    ) || null;
   } catch {
-    return 'Invalid media URL';
+    return null;
   }
-
-  return null;
 }
 
-async function convert(request: NextRequest, cookiesPath?: string, cleanup?: () => Promise<void>) {
+// Retrieve access token from Spotify Web API
+async function getSpotifyToken(): Promise<string> {
+  const clientId = process.env.SPOTIFY_CLIENT_ID;
+  const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    throw new Error('Spotify API credentials are not configured in environment variables');
+  }
+
+  const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+  const response = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${credentials}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: 'grant_type=client_credentials',
+  });
+
+  if (!response.ok) {
+    throw new Error('Failed to authenticate with Spotify API');
+  }
+
+  const data = await response.json();
+  return data.access_token;
+}
+
+// Fetch complete Spotify track metadata
+async function getSpotifyMetadata(url: string): Promise<{
+  artist: string;
+  title: string;
+  durationSec: number;
+}> {
+  const match = url.match(/track\/([a-zA-Z0-9]+)/);
+  if (!match || !match[1]) {
+    throw new Error('Invalid Spotify track URL');
+  }
+
+  const trackId = match[1];
+  const token = await getSpotifyToken();
+
+  let response = await fetch(`https://api.spotify.com/v1/tracks/${trackId}?market=from_token`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!response.ok) {
+    response = await fetch(`https://api.spotify.com/v1/tracks/${trackId}?market=US`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  }
+
+  if (!response.ok) {
+    throw new Error('The requested track does not exist or has been removed from Spotify');
+  }
+
+  const trackData = await response.json();
+  const artist = trackData.artists.map((item: { name: string }) => item.name).join(', ');
+  const title = trackData.name;
+  const durationSec = Math.round((trackData.duration_ms || 0) / 1000);
+
+  return {
+    artist,
+    title,
+    durationSec,
+  };
+}
+
+// Strict matching to verify and download ONLY the original file
+async function findExactAudioSource(metadata: {
+  artist: string;
+  title: string;
+  durationSec: number;
+}): Promise<string> {
+  const { artist, title, durationSec } = metadata;
+
+  type SearchEntry = { id: string; duration?: number; title?: string; uploader?: string };
+  const clean = (value: string) =>
+    value
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .trim();
+  const titleTokens = clean(title).split(/\s+/).filter(Boolean);
+  const artistTokens = clean(artist).split(/\s+/).filter(Boolean);
+  const tokenOverlap = (value: string, tokens: string[]) => {
+    if (!tokens.length) return 0;
+    const normalized = clean(value);
+    return tokens.filter((token) => normalized.includes(token)).length / tokens.length;
+  };
+
+  let entries: SearchEntry[] = [];
+  try {
+    const query = artist ? `ytsearch10:${artist} ${title}` : `ytsearch10:${title} audio`;
+    const searchResults = await youtubedl(query, {
+      dumpSingleJson: true,
+      noWarnings: true,
+      flatPlaylist: true,
+    });
+    entries = (searchResults as { entries?: SearchEntry[] }).entries || [];
+  } catch {
+    // Try SoundCloud below when YouTube search is unavailable.
+  }
+
+  const rankedMatch = entries
+    .map((entry) => {
+      const entryTitle = entry.title || '';
+      const uploader = entry.uploader || '';
+      const titleScore = tokenOverlap(entryTitle, titleTokens);
+      const artistScore = tokenOverlap(`${uploader} ${entryTitle}`, artistTokens);
+      const durationMatch =
+        durationSec > 0 && entry.duration ? Math.abs(entry.duration - durationSec) <= 8 : false;
+
+      return {
+        entry,
+        score: titleScore * 2 + artistScore + (durationMatch ? 2 : 0),
+        trustedName: !artistTokens.length || artistScore > 0 || clean(uploader).includes('topic'),
+        titleScore,
+        durationMatch,
+      };
+    })
+    .filter(
+      (candidate) =>
+        candidate.trustedName &&
+        candidate.titleScore >= (candidate.durationMatch ? 0.34 : 0.5),
+    )
+    .sort((left, right) => right.score - left.score)[0];
+
+  if (rankedMatch) {
+    return `https://www.youtube.com/watch?v=${rankedMatch.entry.id}`;
+  }
+
+  // 3. Fallback to SoundCloud
+  try {
+    const scQuery = artist ? `scsearch5:${artist} ${title}` : `scsearch5:${title}`;
+    const scResults = await youtubedl(scQuery, {
+      dumpSingleJson: true,
+      noWarnings: true,
+      flatPlaylist: true,
+    });
+    const scEntries = (scResults as {
+      entries?: Array<{ url?: string; webpage_url?: string; duration?: number; title?: string }>;
+    }).entries || [];
+
+    const matchedSc = scEntries.find((entry) => {
+      const titleScore = tokenOverlap(entry.title || '', titleTokens);
+      const durationMatch =
+        durationSec > 0 && entry.duration ? Math.abs(entry.duration - durationSec) <= 8 : false;
+      return titleScore >= (durationMatch ? 0.34 : 0.5);
+    });
+
+    if (matchedSc && (matchedSc.webpage_url || matchedSc.url)) {
+      return matchedSc.webpage_url || matchedSc.url!;
+    }
+  } catch {
+    // Continue if SoundCloud lookup fails
+  }
+
+  throw new Error(`No verified public recording was found for "${artist} - ${title}".`);
+}
+
+async function convert(request: NextRequest) {
   const url = request.nextUrl.searchParams.get('url');
-  const requestedPlatform = request.nextUrl.searchParams.get('platform') || 'youtube';
+  const requestedPlatformValue = request.nextUrl.searchParams.get('platform');
   const requestedFormat = request.nextUrl.searchParams.get('format') || 'mp3';
   const requestedQuality = request.nextUrl.searchParams.get('quality') || '192';
 
@@ -66,7 +227,11 @@ async function convert(request: NextRequest, cookiesPath?: string, cleanup?: () 
     return NextResponse.json({ error: 'No URL provided' }, { status: 400 });
   }
 
-  if (!isPlatform(requestedPlatform)) {
+  const requestedPlatform = requestedPlatformValue
+    ? (isPlatform(requestedPlatformValue) ? requestedPlatformValue : null)
+    : (url ? detectPlatform(url) : null);
+
+  if (!requestedPlatform) {
     return NextResponse.json({ error: 'Unsupported source platform' }, { status: 400 });
   }
 
@@ -81,13 +246,15 @@ async function convert(request: NextRequest, cookiesPath?: string, cleanup?: () 
     return NextResponse.json({ error: 'Invalid media URL' }, { status: 422 });
   }
 
-  const platformError = getPlatformError(url);
-  if (platformError) {
-    return NextResponse.json({ error: platformError }, { status: 422 });
+  if (
+    ['spotify', 'soundcloud', 'bandcamp'].includes(requestedPlatform) &&
+    (requestedFormat === 'mp4' || requestedFormat === 'mpeg')
+  ) {
+    return NextResponse.json({ error: `${requestedPlatform} only supports audio formats` }, { status: 400 });
   }
 
   if (!(requestedFormat in FORMAT_CONFIG)) {
-    return NextResponse.json({ error: 'Unsupported audio format' }, { status: 400 });
+    return NextResponse.json({ error: 'Unsupported format' }, { status: 400 });
   }
 
   if (requestedFormat === 'mp3' && !MP3_QUALITIES.includes(requestedQuality as Mp3Quality)) {
@@ -98,156 +265,159 @@ async function convert(request: NextRequest, cookiesPath?: string, cleanup?: () 
     return NextResponse.json({ error: 'Unsupported video quality' }, { status: 400 });
   }
 
-  try {
-    const format = FORMAT_CONFIG[requestedFormat as AudioFormat];
-    const bitrate = requestedFormat === 'mp3' ? `${requestedQuality}k` : format.audioBitrate;
-    // Fetch video metadata to obtain the clean title
-    const videoData = await youtubedl(url, {
-      dumpSingleJson: true,
-      noWarnings: true,
-      preferFreeFormats: true,
-      ...(cookiesPath ? { cookies: cookiesPath } : {}),
-    });
+  const formatConfig = FORMAT_CONFIG[requestedFormat as AudioFormat];
+  const mediaType = formatConfig.mediaType;
+  const numericQuality = Number(requestedQuality);
+  const isPremiumMusic = mediaType === 'audio' && (numericQuality > LIMITS.free.maxMp3Quality || requestedFormat === 'flac' || requestedFormat === 'wav');
+  const plan = getPlan(request);
+  const identity = getUsageIdentity(request);
+  const usageResult = consumeDownload(
+    identity,
+    plan,
+    mediaType,
+    numericQuality,
+    isPremiumMusic,
+  );
 
-    const rawTitle = (videoData as { title?: string }).title || 'audio';
-    const cleanTitle = rawTitle
-      .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '')
+  if (!usageResult.allowed) {
+    const response = NextResponse.json(
+      { error: usageResult.error, code: 'LIMIT_REACHED', plan },
+      { status: 429 },
+    );
+    response.cookies.set('mc-device-id', identity, {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: process.env.NODE_ENV === 'production',
+      maxAge: 60 * 60 * 24 * 365,
+      path: '/',
+    });
+    return response;
+  }
+
+  let workDir: string | undefined;
+
+  try {
+    const format = formatConfig;
+    const bitrate = requestedFormat === 'mp3' ? `${requestedQuality}k` : format.audioBitrate;
+
+    let targetSource = url;
+    let targetTitle = 'audio';
+
+    if (requestedPlatform === 'spotify') {
+      const spotifyInfo = await getSpotifyMetadata(url);
+      targetTitle = `${spotifyInfo.artist} - ${spotifyInfo.title}`;
+      targetSource = await findExactAudioSource(spotifyInfo);
+    } else {
+      const videoData = await youtubedl(url, {
+        dumpSingleJson: true,
+        noWarnings: true,
+        preferFreeFormats: true,
+      });
+      targetTitle = (videoData as { title?: string }).title || 'audio';
+    }
+
+    const cleanTitle = targetTitle
+      .replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
       .trim()
       .replace(/[. ]+$/, '') || 'audio';
+
     const filename = `${cleanTitle}.${format.extension}`;
 
     if (!ffmpegPath) {
-      throw new Error('FFmpeg is not available for media conversion');
+      throw new Error('FFmpeg binary not resolved');
     }
 
-    const ffmpegArgs = ['-loglevel', 'error'];
-    let subprocess: ReturnType<typeof youtubedl.exec> | undefined;
+    const binaryPath: string = ffmpegPath;
 
-    if (format.mediaType === 'video') {
-      const formats = (videoData as {
-        formats?: Array<{ height?: number; ext?: string; vcodec?: string; acodec?: string; url?: string }>;
-      }).formats || [];
-      const maxHeight = Number(requestedQuality);
-      const video = formats
-        .filter((item) => item.url && item.ext === 'mp4' && item.vcodec && item.vcodec !== 'none' && (item.height || 0) <= maxHeight)
-        .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-      const audio = formats.find((item) => item.url && item.acodec && item.acodec !== 'none' && item.ext === 'm4a');
+    workDir = await mkdtemp(path.join(os.tmpdir(), 'music-work-'));
+    const outputPath = path.join(workDir, `output.${format.extension}`);
 
-      if (!video?.url || !audio?.url) {
-        throw new Error(`No compatible video/audio stream found for ${requestedQuality}p`);
+    const formatSelection =
+      format.mediaType === 'video'
+        ? `bestvideo[height<=${requestedQuality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${requestedQuality}]/best`
+        : 'bestaudio/best';
+
+    const subprocess = youtubedl.exec(targetSource, {
+      output: '-',
+      format: formatSelection,
+    });
+
+    if (!subprocess.stdout) {
+      throw new Error('Failed to create stream from process stdout');
+    }
+
+    const ffmpegArgs: string[] = ['-loglevel', 'error', '-y', '-i', 'pipe:0'];
+
+    if (format.mediaType === 'audio') {
+      ffmpegArgs.push('-vn', '-codec:a', format.audioCodec);
+      if (bitrate) {
+        ffmpegArgs.push('-b:a', bitrate);
       }
-
-      ffmpegArgs.push('-i', video.url, '-i', audio.url);
     } else {
-      // Prefer direct HTTPS M4A/MP4 audio streams to avoid unstable WebM URLs.
-      subprocess = youtubedl.exec(url, {
-        output: '-',
-        format: 'bestaudio[ext=m4a]/bestaudio[ext=mp4]',
-        ...(cookiesPath ? { cookies: cookiesPath } : {}),
-      });
+      ffmpegArgs.push('-c:v', format.videoCodec!, '-c:a', format.audioCodec);
+    }
 
-      if (!subprocess.stdout) {
-        throw new Error('Failed to create audio stream from process stdout');
+    ffmpegArgs.push('-f', format.outputFormat, outputPath);
+
+    await new Promise<void>((resolve, reject) => {
+      const converter = spawn(binaryPath, ffmpegArgs);
+
+      if (converter.stdin) {
+        subprocess.stdout!.pipe(converter.stdin);
       }
 
-    }
-
-    const converter = spawn(ffmpegPath, [
-      ...ffmpegArgs,
-      ...(format.mediaType === 'audio' ? ['-i', 'pipe:0'] : []),
-      ...(format.mediaType === 'video'
-        ? ['-c:v', format.videoCodec, '-c:a', format.audioCodec]
-        : ['-vn', '-codec:a', format.audioCodec]),
-      ...(bitrate ? ['-b:a', bitrate] : []),
-      ...(requestedFormat === 'mp4' ? ['-movflags', 'frag_keyframe+empty_moov'] : []),
-      '-f',
-      format.outputFormat,
-      'pipe:1',
-    ]);
-
-    if (subprocess?.stdout) {
-      subprocess.stdout.pipe(converter.stdin);
-    }
-
-    // The stream is returned before yt-dlp exits, so consume its promise to
-    // prevent a failed child process from becoming an unhandled rejection.
-    if (subprocess) {
-      void subprocess.catch((streamError) => {
-        console.error('Audio stream error details:', streamError);
-        converter.stdin.destroy(streamError);
-        converter.kill();
+      converter.on('error', (err: Error) => reject(err));
+      converter.on('close', (code: number | null) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`FFmpeg exited with error code ${code}`));
+        }
       });
-    }
 
-    converter.on('error', (conversionError) => {
-      console.error('MP3 conversion error details:', conversionError);
-      subprocess?.kill();
-    });
-    converter.on('close', () => {
-      void cleanup?.();
+      subprocess.catch((err: unknown) => {
+        converter.kill();
+        reject(err);
+      });
     });
 
-    // Convert FFmpeg's Node process stdout to a standard Web ReadableStream.
-    const webStream = Readable.toWeb(converter.stdout);
+    const fileStat = await stat(outputPath);
+    const fileStream = createReadStream(outputPath);
+    const asciiFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '');
 
-    return new Response(webStream as ReadableStream, {
+    fileStream.on('close', async () => {
+      if (workDir) {
+        await rm(workDir, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+
+    const webStream = Readable.toWeb(fileStream);
+
+    const response = new Response(webStream as ReadableStream, {
       headers: {
-        'Content-Disposition': `attachment; filename="${filename.replace(/"/g, '')}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+        'Content-Disposition': `attachment; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
         'Content-Type': format.contentType,
+        'Content-Length': fileStat.size.toString(),
       },
     });
+    response.headers.set(
+      'Set-Cookie',
+      `mc-device-id=${encodeURIComponent(identity)}; Path=/; Max-Age=${60 * 60 * 24 * 365}; HttpOnly; SameSite=Lax${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`,
+    );
+    return response;
   } catch (error) {
-    // Log failure details in the console for debugging
-    console.error('Download error details:', {
-      error,
-      message: error instanceof Error ? error.message : undefined,
-      stack: error instanceof Error ? error.stack : undefined,
-      details: error && typeof error === 'object' ? Object.getOwnPropertyNames(error) : undefined,
-    });
-    const errorMessage = error instanceof Error && error.message ? error.message : 'Failed to download audio';
-    const isExtractorError = /unsupported url|no video formats found|unable to download|private video|drm/i.test(errorMessage);
-    return NextResponse.json({ error: errorMessage }, { status: isExtractorError ? 422 : 500 });
+    if (workDir) {
+      await rm(workDir, { recursive: true, force: true }).catch(() => {});
+    }
+    console.error('Download error details:', error);
+    const rawError = error instanceof Error ? error.message : '';
+    const errorMessage = /drm protected/i.test(rawError)
+      ? `${requestedPlatform} does not provide a downloadable public stream for this item because it is DRM-protected. Choose another publicly available track.`
+      : rawError || 'Failed to download media';
+    return NextResponse.json({ error: errorMessage }, { status: 422 });
   }
 }
 
 export async function GET(request: NextRequest) {
   return convert(request);
-}
-
-export async function POST(request: NextRequest) {
-  let temporaryDirectory: string | undefined;
-  let handedOffToStream = false;
-
-  try {
-    if (!request.headers.get('content-type')?.startsWith('multipart/form-data')) {
-      return NextResponse.json({ error: 'Use multipart/form-data with a cookies.txt file' }, { status: 400 });
-    }
-
-    const formData = await request.formData();
-    const cookies = formData.get('cookies');
-
-    if (!(cookies instanceof File) || cookies.size === 0) {
-      return NextResponse.json({ error: 'A cookies.txt file is required' }, { status: 400 });
-    }
-
-    if (cookies.size > 2 * 1024 * 1024) {
-      return NextResponse.json({ error: 'The cookies.txt file is too large' }, { status: 400 });
-    }
-
-    temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), 'music-converter-'));
-    const cookiesPath = path.join(temporaryDirectory, 'cookies.txt');
-    await writeFile(cookiesPath, Buffer.from(await cookies.arrayBuffer()), { mode: 0o600 });
-
-    const response = await convert(
-      request,
-      cookiesPath,
-      () => rm(temporaryDirectory!, { recursive: true, force: true }),
-    );
-    handedOffToStream = true;
-    return response;
-  } finally {
-    if (temporaryDirectory && !handedOffToStream) {
-      await rm(temporaryDirectory, { recursive: true, force: true });
-    }
-  }
 }
