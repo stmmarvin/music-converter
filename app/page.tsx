@@ -27,9 +27,8 @@ function getConsentCookie(): CookieConsent {
 }
 
 function saveConsentCookie(consent: Exclude<CookieConsent, null>) {
-  document.cookie = `${CONSENT_COOKIE_NAME}=${consent}; Max-Age=31536000; Path=/; SameSite=Lax${
-    window.location.protocol === 'https:' ? '; Secure' : ''
-  }`;
+  document.cookie = `${CONSENT_COOKIE_NAME}=${consent}; Max-Age=31536000; Path=/; SameSite=Lax${window.location.protocol === 'https:' ? '; Secure' : ''
+    }`;
 }
 
 export default function Home() {
@@ -42,19 +41,22 @@ export default function Home() {
   const [preview, setPreview] = useState<MediaPreview | null>(null);
   const [analyzedUrl, setAnalyzedUrl] = useState('');
   const [error, setError] = useState('');
-  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
-    if (typeof window === 'undefined') {
-      return 'light';
-    }
-
-    const savedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
-    return savedTheme === 'dark' ? 'dark' : 'light';
-  });
+  const [mounted, setMounted] = useState(false);
+  const [theme, setTheme] = useState<'light' | 'dark'>('light');
 
   useEffect(() => {
+    setMounted(true);
+    const savedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
+    if (savedTheme === 'dark') {
+      setTheme('dark');
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!mounted) return;
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem(THEME_STORAGE_KEY, theme);
-  }, [theme]);
+  }, [theme, mounted]);
 
   const cookieConsent = useSyncExternalStore<CookieConsent>(
     (onStoreChange) => {
@@ -135,8 +137,8 @@ export default function Home() {
     setIsLoading(true);
 
     try {
-    const query = `url=${encodeURIComponent(url.trim())}&format=${format}&quality=${quality}`;
-    const response = await fetch(`/api/convert?${query}`);
+      const query = `url=${encodeURIComponent(url.trim())}&format=${format}&quality=${quality}`;
+      const response = await fetch(`/api/convert?${query}`);
 
       if (!response.ok) {
         const result = await response.json().catch(() => null);
@@ -197,7 +199,7 @@ export default function Home() {
             onClick={() => setTheme((current) => (current === 'light' ? 'dark' : 'light'))}
             className="rounded-full border border-white/30 bg-white/10 px-4 py-2 text-xs font-bold uppercase tracking-wider text-white transition hover:bg-white/20"
           >
-            {theme === 'light' ? 'Dark mode' : 'Light mode'}
+            {mounted ? (theme === 'light' ? 'Dark mode' : 'Light mode') : 'Theme'}
           </button>
         </div>
       </header>
@@ -236,7 +238,7 @@ export default function Home() {
           <div className="space-y-6">
             <div>
               <label htmlFor="media-url" className="mb-2 block text-sm font-semibold text-slate-700">
-              Media URL from any supported platform
+                Media URL from any supported platform
               </label>
               <div className="flex flex-col gap-3 sm:flex-row">
                 <input
@@ -244,9 +246,7 @@ export default function Home() {
                   type="url"
                   value={url}
                   onChange={(e) => handleUrlChange(e.target.value)}
-                  placeholder={
-                    'Paste a YouTube, Spotify, Vimeo, SoundCloud, Bandcamp, TikTok, or Instagram URL'
-                  }
+                  placeholder="Paste a YouTube, Spotify, Vimeo, SoundCloud, Bandcamp, TikTok, or Instagram URL"
                   className="theme-input min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3.5 text-slate-900 placeholder-slate-400 outline-none transition focus:border-orange-500 focus:bg-white focus:ring-4 focus:ring-orange-100"
                 />
                 <button
