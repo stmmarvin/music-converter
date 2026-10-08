@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import type { NextRequest } from 'next/server';
+import { pool } from '@/app/lib/db';
 
 export type UsagePlan = 'free' | 'premium';
 
@@ -91,4 +92,12 @@ export function consumeDownload(identity: string, plan: UsagePlan, mediaType: 'a
   }
   usage.set(identity, record);
   return { allowed: true as const };
+}
+export async function getPlanFromDatabase(userId: number): Promise<'free' | 'premium'> {
+  const [rows]: any = await pool.execute(
+    'SELECT status FROM subscriptions WHERE user_id = ? AND status = ? LIMIT 1',
+    [userId, 'active']
+  );
+
+  return rows.length > 0 ? 'premium' : 'free';
 }
