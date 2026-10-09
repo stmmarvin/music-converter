@@ -15,6 +15,7 @@ type MediaPreview = {
 
 const CONSENT_STORAGE_KEY = 'music-converter-cookie-consent';
 const THEME_STORAGE_KEY = 'music-converter-theme';
+const USER_STORAGE_KEY = 'music-converter-user';
 const CONSENT_COOKIE_NAME = 'music-converter-consent';
 type CookieConsent = 'accepted' | 'rejected' | null;
 
@@ -27,8 +28,9 @@ function getConsentCookie(): CookieConsent {
 }
 
 function saveConsentCookie(consent: Exclude<CookieConsent, null>) {
-  document.cookie = `${CONSENT_COOKIE_NAME}=${consent}; Max-Age=31536000; Path=/; SameSite=Lax${window.location.protocol === 'https:' ? '; Secure' : ''
-    }`;
+  document.cookie = `${CONSENT_COOKIE_NAME}=${consent}; Max-Age=31536000; Path=/; SameSite=Lax${
+    window.location.protocol === 'https:' ? '; Secure' : ''
+  }`;
 }
 
 export default function Home() {
@@ -44,11 +46,28 @@ export default function Home() {
   const [mounted, setMounted] = useState(false);
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
 
+  // Account & Stripe state
+  const [user, setUser] = useState<{ id: number; email: string } | null>(null);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [authLoading, setAuthLoading] = useState(false);
+  const [isCheckingOut, setIsCheckingOut] = useState(false);
+
   useEffect(() => {
     setMounted(true);
     const savedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
     if (savedTheme === 'dark') {
       setTheme('dark');
+    }
+    const savedUser = window.localStorage.getItem(USER_STORAGE_KEY);
+    if (savedUser) {
+      try {
+        setUser(JSON.parse(savedUser));
+      } catch {
+        window.localStorage.removeItem(USER_STORAGE_KEY);
+      }
     }
   }, []);
 
@@ -78,6 +97,70 @@ export default function Home() {
     saveConsentCookie(consent);
     window.localStorage.removeItem(CONSENT_STORAGE_KEY);
     window.dispatchEvent(new Event('music-converter-consent-change'));
+  };
+
+  const handleRegister = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError('');
+    setAuthLoading(true);
+
+    try {
+      const res = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: authEmail, password: authPassword }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Registratie mislukt');
+      }
+
+      const activeUser = { id: data.userId, email: authEmail };
+      setUser(activeUser);
+      window.localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(activeUser));
+      setShowAuthModal(false);
+      setAuthPassword('');
+    } catch (err: any) {
+      setAuthError(err.message);
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleLogout = () => {
+    setUser(null);
+    window.localStorage.removeItem(USER_STORAGE_KEY);
+  };
+
+  const handleUpgrade = async () => {
+    if (!user) {
+      setShowAuthModal(true);
+      return;
+    }
+
+    setIsCheckingOut(true);
+    setError('');
+
+    try {
+      const res = await fetch('/api/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: user.id }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Betaalsessie starten mislukt');
+      }
+
+      if (data.url) {
+        window.location.href = data.url;
+      }
+    } catch (checkoutError: any) {
+      setError(checkoutError.message);
+      setIsCheckingOut(false);
+    }
   };
 
   const handleUrlChange = (value: string) => {
@@ -187,20 +270,47 @@ export default function Home() {
             </span>
             Media Converter <span className="text-orange-100">Music &amp; Video</span>
           </Link>
+
           <nav className="hidden items-center gap-8 text-sm font-semibold text-orange-50 sm:flex" aria-label="Main navigation">
             <a href="#converter" className="transition hover:text-white">Converter</a>
             <a href="#how-it-works" className="transition hover:text-white">Tutorial</a>
             <Link href="/faq" className="transition hover:text-white">FAQ</Link>
             <Link href="/privacy" className="transition hover:text-white">Privacy</Link>
           </nav>
-          <button
-            type="button"
-            aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
-            onClick={() => setTheme((current) => (current === 'light' ? 'dark' : 'light'))}
-            className="rounded-full border border-white/30 bg-white/10 px-4 py-2 text-xs font-bold uppercase tracking-wider text-white transition hover:bg-white/20"
-          >
-            {mounted ? (theme === 'light' ? 'Dark mode' : 'Light mode') : 'Theme'}
-          </button>
+
+          <div className="flex items-center gap-3">
+            {user ? (
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold text-white/90 truncate max-w-[120px]">
+                  {user.email}
+                </span>
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  className="rounded-full border border-white/30 bg-white/10 px-3 py-1.5 text-xs font-bold text-white transition hover:bg-white/20"
+                >
+                  Uitloggen
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setShowAuthModal(true)}
+                className="rounded-full bg-white px-4 py-2 text-xs font-bold uppercase tracking-wider text-orange-800 transition hover:bg-orange-50"
+              >
+                Account
+              </button>
+            )}
+
+            <button
+              type="button"
+              aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
+              onClick={() => setTheme((current) => (current === 'light' ? 'dark' : 'light'))}
+              className="rounded-full border border-white/30 bg-white/10 px-4 py-2 text-xs font-bold uppercase tracking-wider text-white transition hover:bg-white/20"
+            >
+              {mounted ? (theme === 'light' ? 'Dark mode' : 'Light mode') : 'Theme'}
+            </button>
+          </div>
         </div>
       </header>
 
@@ -367,14 +477,27 @@ export default function Home() {
             )}
 
             <aside className="rounded-2xl border border-orange-200 bg-orange-50 p-5">
-              <p className="text-xs font-bold uppercase tracking-[0.18em] text-orange-700">Free plan</p>
-              <p className="mt-2 text-sm leading-6 text-slate-700">
-                3 videos per day up to 720p and 20 standard music downloads per day.
-                Premium unlocks 4K video and high-quality music.
-              </p>
+              <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <p className="text-xs font-bold uppercase tracking-[0.18em] text-orange-700">Abonnement</p>
+                  <p className="mt-1 text-sm leading-6 text-slate-700">
+                    Gratis: 3 video's per dag tot 720p en 20 standaard audiodownloads.
+                    Upgrade naar Premium voor 4K video's en 320 kbps MP3.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void handleUpgrade()}
+                  disabled={isCheckingOut}
+                  className="shrink-0 rounded-xl bg-orange-600 px-5 py-2.5 text-sm font-bold text-white shadow-md shadow-orange-200 transition hover:bg-orange-700 disabled:opacity-60"
+                >
+                  {isCheckingOut ? 'Laden...' : 'Upgrade naar Premium'}
+                </button>
+              </div>
+
               {isPremiumFormat && (
-                <p className="mt-3 rounded-lg bg-white/70 p-3 text-sm font-semibold text-orange-800">
-                  This quality is Premium-only. Subscribe to unlock higher quality and larger limits.
+                <p className="mt-3 rounded-lg bg-white/80 p-3 text-sm font-semibold text-orange-800">
+                  Dit formaat of deze kwaliteit vereist een Premium abonnement. Klik op 'Upgrade naar Premium' om af te rekenen.
                 </p>
               )}
             </aside>
@@ -401,6 +524,69 @@ export default function Home() {
           </p>
         </section>
       </div>
+
+      {/* Account Registratie Modal */}
+      {showAuthModal && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+        >
+          <div className="w-full max-w-md rounded-3xl bg-white p-7 shadow-2xl">
+            <h2 className="text-2xl font-bold text-slate-900">Account aanmaken</h2>
+            <p className="mt-1 text-sm text-slate-600">Maak direct een account aan in jouw database.</p>
+
+            {authError && (
+              <div className="mt-4 rounded-xl border border-red-200 bg-red-50 p-3 text-xs font-semibold text-red-700">
+                {authError}
+              </div>
+            )}
+
+            <form onSubmit={handleRegister} className="mt-5 space-y-4">
+              <div>
+                <label className="block text-xs font-bold uppercase tracking-wider text-slate-700">E-mailadres</label>
+                <input
+                  type="email"
+                  required
+                  value={authEmail}
+                  onChange={(e) => setAuthEmail(e.target.value)}
+                  className="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-2.5 text-sm text-slate-900 outline-none focus:border-orange-500"
+                  placeholder="naam@voorbeeld.nl"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold uppercase tracking-wider text-slate-700">Wachtwoord</label>
+                <input
+                  type="password"
+                  required
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                  className="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-2.5 text-sm text-slate-900 outline-none focus:border-orange-500"
+                  placeholder="••••••••"
+                />
+              </div>
+
+              <div className="mt-6 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowAuthModal(false)}
+                  className="rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+                >
+                  Annuleren
+                </button>
+                <button
+                  type="submit"
+                  disabled={authLoading}
+                  className="rounded-xl bg-orange-600 px-5 py-2.5 text-sm font-bold text-white hover:bg-orange-700 disabled:opacity-60"
+                >
+                  {authLoading ? 'Opslaan...' : 'Account aanmaken'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {cookieConsent === null && (
         <div

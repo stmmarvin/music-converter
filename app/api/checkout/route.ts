@@ -39,7 +39,8 @@ export async function POST(request: NextRequest) {
     });
 
     return NextResponse.json({ url: session.url });
-  } catch (error) {
-    return NextResponse.json({ error: 'Sessie kon niet worden gestart' }, { status: 500 });
+  } catch (error: any) {
+    console.error('Stripe Checkout fout:', error?.message || error);
+    return NextResponse.json({ error: error?.message || 'Sessie kon niet worden gestart' }, { status: 500 });
   }
 }
